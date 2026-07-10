@@ -3,9 +3,11 @@
 
 import argparse
 import io
+import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from Bio import SeqIO
@@ -74,6 +76,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _n_workers() -> int:
+    try:
+        return len(os.sched_getaffinity(0))  # respects CPU affinity / container limits
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
 def extract_sequence(pdb_path: str, chain_id: str) -> str:
     stem = Path(pdb_path).stem
     parser = PDBParser(QUIET=True)
@@ -96,13 +105,19 @@ def extract_all_sequences(folder: str, chain_id: str) -> dict:
     pdb_files = sorted(Path(folder).glob("*.pdb"))
     if not pdb_files:
         sys.exit(f"Error: No .pdb files found in '{folder}'")
-    sequences = {}
-    for pdb_path in pdb_files:
-        try:
-            seq = extract_sequence(str(pdb_path), chain_id)
-            sequences[pdb_path.stem] = seq
-        except Exception as e:
-            print(f"Warning: skipping {pdb_path.name}: {e}")
+    n = _n_workers()
+    print(f"Extracting sequences using {n} worker(s)...")
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        future_to_path = {ex.submit(extract_sequence, str(p), chain_id): p for p in pdb_files}
+        results = {}
+        for future in as_completed(future_to_path):
+            p = future_to_path[future]
+            try:
+                results[p.stem] = future.result()
+            except Exception as e:
+                print(f"Warning: skipping {p.name}: {e}")
+    # Restore original sort order
+    sequences = {p.stem: results[p.stem] for p in pdb_files if p.stem in results}
     if not sequences:
         sys.exit("Error: No sequences could be extracted.")
     print(f"\nExtracted {len(sequences)} sequence(s) from '{folder}':")
@@ -331,17 +346,23 @@ def extract_all_ss(sequences: dict) -> dict:
         print("Warning: PSIPRED not found on PATH — secondary structure will be omitted.")
         print("  Install with: conda install -c bioconda psipred")
         return {}
-    print(f"Running PSIPRED ({cmd}) on {len(sequences)} sequence(s)...")
-    ss_data = {}
-    for name, seq in sequences.items():
-        print(f"  {name}... ", end="", flush=True)
-        ss = _run_psipred(seq, name, cmd)
-        if ss:
-            print("done")
-            ss_data[name] = ss
-        else:
-            print("failed")
-    return ss_data
+    n = _n_workers()
+    print(f"Running PSIPRED ({cmd}) on {len(sequences)} sequence(s) using {n} worker(s)...")
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        future_to_name = {ex.submit(_run_psipred, seq, name, cmd): name
+                          for name, seq in sequences.items()}
+        completed = {}
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                ss = future.result()
+                completed[name] = ss
+                print(f"  {name}: {'done' if ss else 'failed'}")
+            except Exception as e:
+                completed[name] = None
+                print(f"  {name}: error — {e}")
+    # Restore original order, drop failures
+    return {name: completed[name] for name in sequences if completed.get(name)}
 
 
 def save_fasta(aligned: dict, output_path: str) -> None:
